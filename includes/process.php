@@ -257,11 +257,9 @@ class flash_cache_process {
 
 		// Save raw HTML and compressed version
 		file_put_contents($cache_path . 'index-cache.html', $html);
-		file_put_contents($cache_path . 'index-cache.html.gz', $gzip_html);
 
 		// Track disk usage for monitoring/logging purposes
 		flash_cache_increment_disk_usage(mb_strlen($html, '8bit'));
-		flash_cache_increment_disk_usage(mb_strlen($gzip_html, '8bit'));
 
 		// Release cache lock
 		self::end_create_cache();
