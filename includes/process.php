@@ -186,69 +186,84 @@ class flash_cache_process {
 	}
 
 	public static function create_cache_html() {
+		// Set origin URL if not already set
 		if (is_null(self::$origin_url)) {
 			self::$origin_url = get_site_url(null, '/');
 		}
+
+		// Sanitize the origin URL (normalize slashes, scheme, etc.)
 		self::$origin_url = flash_cache_sanitize_origin_url(self::$origin_url);
 
+		// Load plugin advanced settings and define the base cache directory
 		$advanced_settings = flash_cache_get_advanced_settings();
-		$cache_dir		   = rtrim(flash_cache_get_home_path() . $advanced_settings['cache_dir'], '/') . '/';
-		$server_name	   = trim(flash_cache_get_server_name(), '/');
+		$cache_dir         = trailingslashit(rtrim(flash_cache_get_home_path(), '/') . $advanced_settings['cache_dir']);
 
-		if (empty($server_name)) {
-			error_log('Error: flash_cache_get_server_name() returned an empty value.');
-			$server_name = 'default';
-		}
+		// Extract host from the origin URL and remove 'www.' prefix for consistency
+		$parsed_origin     = parse_url(self::$origin_url);
+		$origin_host       = isset($parsed_origin['host']) ? strtolower($parsed_origin['host']) : 'default';
+		$server_name       = preg_replace('/^www\./i', '', $origin_host); // Normalize to avoid duplicate folders
 
+		// Validate and parse the URL to cache
 		if (filter_var(self::$url_to_cache, FILTER_VALIDATE_URL)) {
-			$parsed_url		= parse_url(self::$url_to_cache);
-			$host_to_remove = $parsed_url['host'] ?? '';
-			$relative_path	= str_replace($parsed_url['scheme'] . '://' . $parsed_url['host'] . (isset($parsed_url['port']) ? ':' . $parsed_url['port'] : ''), '', self::$url_to_cache);
+			$parsed_url = parse_url(self::$url_to_cache);
+
+			// Get the path part of the URL, e.g., 'category/page-name'
+			$path = isset($parsed_url['path']) ? trim($parsed_url['path'], '/') : '';
+
+			// Optional: Append query string if present to differentiate cache entries
+			if (isset($parsed_url['query'])) {
+				$path .= '?' . $parsed_url['query'];
+			}
 		} else {
-			preg_match('~flash_cache/([^/]+)/~', self::$url_to_cache, $matches);
-			$host_to_remove = $matches[1] ?? '';
-			$relative_path	= str_replace($host_to_remove, '', self::$url_to_cache);
+			// Invalid URL provided, abort caching and log an error
+			error_log('Cache HTML aborted: Invalid URL → ' . self::$url_to_cache);
+			return;
 		}
 
-		$path		= trim(str_replace(self::$origin_url, '', $relative_path), '/');
-		$cache_path = trailingslashit($cache_dir . flash_cache_get_server_name() . '/' . $path);
-		$response	= flash_cache_get_content(self::$url_to_cache);
+		// Build absolute filesystem paths
+		$parent_dir = $cache_dir . $server_name;                   // e.g., /cache-dir/mysite.com/
+		$cache_path = trailingslashit($parent_dir . '/' . $path);  // e.g., /cache-dir/mysite.com/category/page/
 
-		$parent_dir = $cache_dir . $server_name;
+		// Ensure cache parent directory exists
 		if (!file_exists($parent_dir)) {
-
 			@mkdir($parent_dir, 0777, true);
 		}
-		if (!file_exists($cache_path)) {
 
+		// Ensure page-specific cache directory exists
+		if (!file_exists($cache_path)) {
 			@mkdir($cache_path, 0777, true);
 		}
 
-		/**
-		 * If the file cannot be locked, another user is already creating the cache.
-		 */
+		// Attempt to lock the cache creation process (avoid race conditions)
 		if (!self::start_create_cache($cache_path)) {
 			self::end_create_cache();
 			return false;
 		}
 
-		/**
-		 * If a blank page was obtained it returns without caching.
-		 */
+		// Retrieve the page content to cache
+		$response = flash_cache_get_content(self::$url_to_cache);
+
+		// Abort if the response is empty (e.g., failed fetch, 404, etc.)
 		if (empty($response['response'])) {
+			self::end_create_cache();
 			return;
 		}
 
-		self::debug('Creating HTML cache file path:' . $path . ' - URL:' . self::$url_to_cache);
+		// Log for debugging
+		self::debug('Creating HTML cache: ' . self::$url_to_cache . ' → ' . $cache_path);
 
-		$response['response'] = apply_filters('flash_cache_response_html', $response['response'], self::$url_to_cache);
+		// Allow custom filters to modify HTML before saving (e.g., remove scripts, ads)
+		$html = apply_filters('flash_cache_response_html', $response['response'], self::$url_to_cache);
 
-		$gzip_html = gzencode($response['response']);
-		file_put_contents($cache_path . 'index-cache.html', $response['response']);
+		// Save raw HTML and compressed version
+		file_put_contents($cache_path . 'index-cache.html', $html);
 		file_put_contents($cache_path . 'index-cache.html.gz', $gzip_html);
-		flash_cache_increment_disk_usage(mb_strlen($response['response'], '8bit'));
+
+		// Track disk usage for monitoring/logging purposes
+		flash_cache_increment_disk_usage(mb_strlen($html, '8bit'));
 		flash_cache_increment_disk_usage(mb_strlen($gzip_html, '8bit'));
 
+		// Release cache lock
 		self::end_create_cache();
 	}
 
