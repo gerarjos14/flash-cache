@@ -43,17 +43,44 @@ class flash_cache_process {
 	 * @return void
 	 * @since 1.0.0
 	 */
-	public static function get_file_lock($path_file) {
-		if (!file_exists($path_file)) {
-			@mkdir($path_file, 0777, true);
-			file_put_contents($path_file . 'can_create_cache.txt', 'Created by Flash Cache');
+	public static function get_file_lock(string $path_file): bool {
+		// 1) normalize: ensure $path_file is treated as a directory
+		$dir = rtrim($path_file, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+		$lockFile = $dir . 'can_create_cache.txt';
+
+		// 2) make sure directory exists
+		if (!is_dir($dir)) {
+			if (!@mkdir($dir, 0777, true) && !is_dir($dir)) {
+				self::debug("Flash Cache: failed to mkdir({$dir})");
+				return false;
+			}
 		}
-		self::$can_cache_handler = fopen($path_file . 'can_create_cache.txt', 'a');
-		/**
-		 * bloquea exclusivamente el archivo (el archivo solo puede ser leído y escrito por el usuario), 
-		 * luego, si otros usuarios nuevos desean acceder al archivo, serán bloqueados hasta que el primero cierre el archivo (libera el bloqueo).
-		 * */
-		return flock(self::$can_cache_handler, LOCK_EX | LOCK_NB);
+
+		// 3) if the lock‐file doesn’t exist, create it
+		if (!file_exists($lockFile)) {
+			$bytes = @file_put_contents($lockFile, 'Created by Flash Cache');
+			if ($bytes === false) {
+				self::debug("Flash Cache: failed to write lock file {$lockFile}");
+				return false;
+			}
+		}
+
+		// 4) finally, open for appending and lock
+		$fh = @fopen($lockFile, 'a');
+		if ($fh === false) {
+			self::debug("Flash Cache: fopen({$lockFile}) failed");
+			return false;
+		}
+
+		$gotLock = flock($fh, LOCK_EX | LOCK_NB);
+		if (!$gotLock) {
+			fclose($fh);
+			return false;
+		}
+
+		// store the valid handler for later unlock/close
+		self::$can_cache_handler = $fh;
+		return true;
 	}
 
 	public static function get_db_lock($path_file) {
@@ -118,15 +145,24 @@ class flash_cache_process {
 	 * @return void
 	 * @since 1.0.0
 	 */
-	public static function end_create_cache() {
+	public static function end_create_cache(): bool {
 		$advanced_settings = flash_cache_get_advanced_settings();
-		if (!empty($advanced_settings['lock_type'])) {
-			if ($advanced_settings['lock_type'] == 'db') {
-				return true;
-			}
+
+		// If you’re using DB‐based locking, skip the file lock entirely
+		if ( ! empty( $advanced_settings['lock_type'] ) && $advanced_settings['lock_type'] === 'db' ) {
+			return true;
 		}
-		flock(self::$can_cache_handler, LOCK_UN);
-		fclose(self::$can_cache_handler);
+
+		// Only unlock/close if we really have a valid file handle
+		if ( isset( self::$can_cache_handler )
+			&& is_resource( self::$can_cache_handler )
+			&& get_resource_type( self::$can_cache_handler ) === 'stream'
+		) {
+			flock( self::$can_cache_handler, LOCK_UN );
+			fclose( self::$can_cache_handler );
+			self::$can_cache_handler = null;  // clear it so you don’t accidentally reuse it
+		}
+
 		return true;
 	}
 
