@@ -222,187 +222,145 @@ class flash_cache_process {
 	}
 
 	public static function create_cache_html() {
-		// Set origin URL if not already set
+
 		if (is_null(self::$origin_url)) {
 			self::$origin_url = get_site_url(null, '/');
 		}
 
-		// Sanitize the origin URL (normalize slashes, scheme, etc.)
 		self::$origin_url = flash_cache_sanitize_origin_url(self::$origin_url);
 
-		// Load plugin advanced settings and define the base cache directory
 		$advanced_settings = flash_cache_get_advanced_settings();
-		$cache_dir = trailingslashit(rtrim(flash_cache_get_home_path(), '/') . '/' . ltrim($advanced_settings['cache_dir'], '/'));
+		$cache_dir		   = rtrim(flash_cache_get_home_path() . $advanced_settings['cache_dir'], '/') . '/';
+		$server_name	   = trim(flash_cache_get_server_name(), '/');
 
-		// Extract host from the origin URL and remove 'www.' prefix for consistency
-		$parsed_origin     = parse_url(self::$origin_url);
-		$origin_host       = isset($parsed_origin['host']) ? strtolower($parsed_origin['host']) : 'default';
-		$server_name       = preg_replace('/^www\./i', '', $origin_host); // Normalize to avoid duplicate folders
-
-		// Validate and parse the URL to cache
-		if (filter_var(self::$url_to_cache, FILTER_VALIDATE_URL)) {
-			$parsed_url = parse_url(self::$url_to_cache);
-
-			// Get the path part of the URL, e.g., 'category/page-name'
-			$path = isset($parsed_url['path']) ? trim($parsed_url['path'], '/') : '';
-
-			// Optional: Append query string if present to differentiate cache entries
-			if (isset($parsed_url['query'])) {
-				$path .= '?' . $parsed_url['query'];
-			}
-		} else {
-			// Invalid URL provided, abort caching and log an error
-			error_log('Cache HTML aborted: Invalid URL → ' . self::$url_to_cache);
-			return;
+		if (empty($server_name)) {
+			error_log('Error: flash_cache_get_server_name() returned an empty value.');
+			$server_name = 'default';
 		}
 
-		// Build absolute filesystem paths
-		$parent_dir = $cache_dir . $server_name;                   // e.g., /cache-dir/mysite.com/
-		$cache_path = trailingslashit($parent_dir . '/' . $path);  // e.g., /cache-dir/mysite.com/category/page/
+		if (filter_var(self::$url_to_cache, FILTER_VALIDATE_URL)) {
+			$parsed_url		= parse_url(self::$url_to_cache);
+			$host_to_remove = $parsed_url['host'] ?? '';
+			$relative_path	= str_replace($parsed_url['scheme'] . '://' . $parsed_url['host'] . (isset($parsed_url['port']) ? ':' . $parsed_url['port'] : ''), '', self::$url_to_cache);
+		} else {
+			preg_match('~flash_cache/([^/]+)/~', self::$url_to_cache, $matches);
+			$host_to_remove = $matches[1] ?? '';
+			$relative_path	= str_replace($host_to_remove, '', self::$url_to_cache);
+		}
 
-		// Ensure cache parent directory exists
+		$path		= trim(str_replace(self::$origin_url, '', $relative_path), '/');
+		$cache_path = trailingslashit($cache_dir . flash_cache_get_server_name() . '/' . $path);
+		$response	= flash_cache_get_content(self::$url_to_cache);
+
+		$parent_dir = $cache_dir . $server_name;
 		if (!file_exists($parent_dir)) {
+
 			@mkdir($parent_dir, 0777, true);
 		}
-
-		// Ensure page-specific cache directory exists
 		if (!file_exists($cache_path)) {
 			@mkdir($cache_path, 0777, true);
 		}
 
-		// Attempt to lock the cache creation process (avoid race conditions)
+		/**
+		 * If the file cannot be locked, another user is already creating the cache.
+		 */
 		if (!self::start_create_cache($cache_path)) {
 			self::end_create_cache();
 			return false;
 		}
 
-		// Retrieve the page content to cache
-		$response = flash_cache_get_content(self::$url_to_cache);
+		/**
+		 * If a blank page was obtained it returns without caching.
+		 */
 
-		// Abort if the response is empty (e.g., failed fetch, 404, etc.)
 		if (empty($response['response'])) {
-			self::end_create_cache();
+
 			return;
 		}
 
-		// Log for debugging
-		self::debug('Creating HTML cache: ' . self::$url_to_cache . ' → ' . $cache_path);
+		self::debug('Creating HTML cache file path:' . $path . ' - URL:' . self::$url_to_cache);
 
-		// Allow custom filters to modify HTML before saving (e.g., remove scripts, ads)
-		$html = apply_filters('flash_cache_response_html', $response['response'], self::$url_to_cache);
+		$response['response'] = apply_filters('flash_cache_response_html', $response['response'], self::$url_to_cache);
+		$gzip_html = gzencode($response['response']);
 
-		// Save raw HTML and compressed version
-		file_put_contents($cache_path . 'index-cache.html', $html);
+		file_put_contents($cache_path . 'index-cache.html', $response['response']);
+		file_put_contents($cache_path . 'index-cache.html.gz', $gzip_html);
 
-		// Track disk usage for monitoring/logging purposes
-		flash_cache_increment_disk_usage(mb_strlen($html, '8bit'));
+		flash_cache_increment_disk_usage(mb_strlen($response['response'], '8bit'));
+		flash_cache_increment_disk_usage(mb_strlen($gzip_html, '8bit'));
 
-		// Release cache lock
 		self::end_create_cache();
 	}
 
 	public static function create_cache_php() {
 		global $wp_query;
 
-		// Set the origin URL if not already initialized
 		if (is_null(self::$origin_url)) {
 			self::$origin_url = get_site_url(null, '/');
 		}
+		self::$origin_url  = flash_cache_sanitize_origin_url(self::$origin_url);
+		$advanced_settings = wp_parse_args(get_option('flash_cache_advanced_settings', array()), flash_cache_settings::default_advanced_options());
+		$home_path		   = flash_cache_get_home_path();
+		$cache_dir		   = $home_path . $advanced_settings['cache_dir'];
 
-		// Sanitize and normalize the origin URL
-		self::$origin_url = flash_cache_sanitize_origin_url(self::$origin_url);
+		$parsed_url = parse_url(self::$url_to_cache);
 
-		// Get advanced cache settings and base cache path
-		$advanced_settings = wp_parse_args(
-			get_option('flash_cache_advanced_settings', array()),
-			flash_cache_settings::default_advanced_options()
-		);
-		$home_path = flash_cache_get_home_path();
-		$cache_dir = trailingslashit($home_path . $advanced_settings['cache_dir']);
+		$relative_url = str_replace($parsed_url['scheme'] . '://' . $parsed_url['host'] . (isset($parsed_url['port']) ? ':' . $parsed_url['port'] : ''), '', self::$url_to_cache);
 
-		// Parse the host from the origin URL and normalize it (remove 'www.')
-		$parsed_origin = parse_url(self::$origin_url);
-		$origin_host   = isset($parsed_origin['host']) ? strtolower($parsed_origin['host']) : 'default';
-		$server_name   = preg_replace('/^www\./i', '', $origin_host);
+		$path		= str_replace(self::$origin_url, '', $relative_url);
+		$cache_path = trailingslashit($cache_dir . flash_cache_get_server_name() . '/' . $path);
 
-		// Parse the URL to cache and build its relative path
-		if (!filter_var(self::$url_to_cache, FILTER_VALIDATE_URL)) {
-			error_log('PHP cache aborted: Invalid URL → ' . self::$url_to_cache);
-			return;
-		}
-
-		$parsed_url   = parse_url(self::$url_to_cache);
-		$relative_url = isset($parsed_url['path']) ? trim($parsed_url['path'], '/') : '';
-
-		// Optional: append query string to differentiate request variants
-		if (isset($parsed_url['query'])) {
-			$relative_url .= '?' . $parsed_url['query'];
-		}
-
-		// Construct the full filesystem path to store the PHP cache
-		$cache_path = trailingslashit($cache_dir . $server_name . '/' . $relative_url);
-
-		// Create directory if it doesn't exist
 		if (!file_exists($cache_path)) {
 			@mkdir($cache_path, 0777, true);
 		}
 
-		// Lock cache creation process to prevent conflicts
 		if (!self::start_create_cache($cache_path)) {
 			self::end_create_cache();
 			return false;
 		}
 
-		// Get PHP cache template and replace placeholders with actual data
-		$cache_template = apply_filters(
-			'flash_cache_template_file',
-			FLASH_CACHE_PLUGIN_DIR . 'includes/cache.tpl',
-			$advanced_settings
-		);
+		$cache_template = apply_filters('flash_cache_template_file', FLASH_CACHE_PLUGIN_DIR . 'includes/' . 'cache.tpl', $advanced_settings);
 
-		self::debug('Creating PHP cache for: ' . self::$url_to_cache . ' → ' . $cache_path);
-
+		self::debug('Creating PHP cache file path:' . $path . ' - URL:' . self::$url_to_cache);
 		$template_php = file_get_contents($cache_template);
 		$template_php = str_replace('{home_path}', "'" . $home_path . "'", $template_php);
 		$template_php = str_replace('{url_path}', "'" . self::$url_to_cache . "'", $template_php);
 		$template_php = str_replace('{minimum_ttl}', self::$pattern['ttl_minimum'], $template_php);
 		$template_php = str_replace('{maximum_ttl}', self::$pattern['ttl_maximum'], $template_php);
+		$request_url  = flash_cache_get_content_to_php(self::$url_to_cache);
 
-		// Get the HTML response and content type for this request
-		$request_url = flash_cache_get_content_to_php(self::$url_to_cache);
+		if (defined('FLASH_CACHE_NOT_USE_THIS_REQUEST')) {
+			$request = hash('sha256', http_build_query(array()));
+		} else {
+			$request = hash('sha256', http_build_query($_REQUEST));
+		}
 
-		// Generate a hash based on current $_REQUEST or an empty fallback
-		$request_hash = defined('FLASH_CACHE_NOT_USE_THIS_REQUEST')
-			? hash('sha256', http_build_query(array()))
-			: hash('sha256', http_build_query($_REQUEST));
-
-		// Subdirectory for per-request cache files
 		$request_path = 'requests/';
 		if (!file_exists($cache_path . $request_path)) {
 			@mkdir($cache_path . $request_path, 0777, true);
 		}
 
-		// Save main PHP cache loader if not yet created
-		$main_php_path = $cache_path . 'index-cache.php';
-		if (!file_exists($main_php_path)) {
-			file_put_contents($main_php_path, $template_php);
+		if (!file_exists($cache_path . 'index-cache.php')) {
+			file_put_contents($cache_path . 'index-cache.php', $template_php);
+
+
 			flash_cache_increment_disk_usage(mb_strlen($template_php, '8bit'));
 		}
 
-		// Save individual request content and headers
-		$request_file_path = $cache_path . $request_path . $request_hash . '.html';
-		$header_file_path  = $cache_path . $request_path . $request_hash . '.header';
+		$request_file_path = $cache_path . $request_path . $request . '.html';
+		$header_file_path  = $cache_path . $request_path . $request . '.header';
 
-		if (is_search() && $wp_query->post_count > 0 || !is_search()) {
+		if (is_search() && $wp_query->post_count > 0) {
+			file_put_contents($request_file_path, $request_url['response']);
+			file_put_contents($header_file_path, $request_url['content_type']);
+		} elseif (!is_search()) {
 			file_put_contents($request_file_path, $request_url['response']);
 			file_put_contents($header_file_path, $request_url['content_type']);
 		}
 
-		// Track disk usage
 		flash_cache_increment_disk_usage(mb_strlen($request_url['response'], '8bit'));
 		flash_cache_increment_disk_usage(mb_strlen($request_url['content_type'], '8bit'));
 
-		// Unlock
 		self::end_create_cache();
 	}
 
