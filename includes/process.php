@@ -232,7 +232,7 @@ class flash_cache_process {
 
 		// Load plugin advanced settings and define the base cache directory
 		$advanced_settings = flash_cache_get_advanced_settings();
-		$cache_dir         = trailingslashit(rtrim(flash_cache_get_home_path(), '/') . $advanced_settings['cache_dir']);
+		$cache_dir = trailingslashit(rtrim(flash_cache_get_home_path(), '/') . '/' . ltrim($advanced_settings['cache_dir'], '/'));
 
 		// Extract host from the origin URL and remove 'www.' prefix for consistency
 		$parsed_origin     = parse_url(self::$origin_url);
